@@ -17,6 +17,7 @@
 #   gem: rest-client
 #   gem: socket
 #   gem: json
+#   gem: openssl
 #
 # USAGE:
 #   #YELLOW
@@ -33,12 +34,13 @@ require 'sensu-plugin/metric/cli'
 require 'rest-client'
 require 'socket'
 require 'json'
+require 'openssl'
 
 #
 # Jenkins Metrics
 #
 class JenkinsMetrics < Sensu::Plugin::Metric::CLI::Graphite
-  SKIP_ROOT_KEYS = %w(version).freeze
+  SKIP_ROOT_KEYS = %w[version].freeze
 
   option :scheme,
          description: 'Metric naming scheme',
@@ -56,7 +58,7 @@ class JenkinsMetrics < Sensu::Plugin::Metric::CLI::Graphite
          description: 'Jenkins Port',
          short: '-p PORT',
          long: '--port PORT',
-         default: '8080'
+         proc: proc(&:to_i)
 
   option :uri,
          description: 'Jenkins Metrics URI',
@@ -91,6 +93,22 @@ class JenkinsMetrics < Sensu::Plugin::Metric::CLI::Graphite
          description: 'Report the duration of the REST request',
          default: true
 
+  option :ssl_ca_cert,
+         long: '--ssl_ca_cert CA_CERT',
+         description: 'The path to the TLS CA certificate file'
+
+  option :ssl_client_cert,
+         long: '--ssl_client_cert CLIENT_CERT',
+         description: 'The path to the TLS client certificate file'
+
+  option :ssl_client_key,
+         long: '--ssl_client_key CLIENT_KEY',
+         description: 'The path to the TLS client key file'
+
+  option :ssl_client_key_pass,
+         long: '--ssl_client_key_pass CLIENT_KEY_PASSWORD',
+         description: 'The password for the TLS client key'
+
   def report_request_duration
     return unless config[:report_request_duration]
     @stop ||= DateTime.now
@@ -102,13 +120,33 @@ class JenkinsMetrics < Sensu::Plugin::Metric::CLI::Graphite
     @start = DateTime.now
     @stop = nil
     begin
-      https ||= config[:https] ? 'https' : 'http'
-      testurl = "#{https}://#{config[:server]}:#{config[:port]}#{config[:uri]}"
+      scheme ||= config[:https] ? 'https' : 'http'
+      # port ||= config[:port] ? default_port
+      testurl = "#{scheme}://#{config[:server]}:#{config[:port]}#{config[:uri]}"
 
       r = if config[:https] && config[:insecure]
             RestClient::Resource.new(testurl, timeout: config[:timeout], verify_ssl: false).get
           elsif config[:https]
-            RestClient::Resource.new(testurl, timeout: config[:timeout], verify_ssl: true).get
+            if config[:ssl_client_cert]
+              client_cert = OpenSSL::X509::Certificate.new(File.read(config[:ssl_client_cert]))
+              client_key = OpenSSL::PKey::RSA.new(File.read(config[:ssl_client_key]), config[:ssl_client_key_pass])
+              ca_file = config[:ssl_ca_cert]
+              verify_ssl = if config[:insecure]
+                             OpenSSL::SSL::VERIFY_NONE
+                           else
+                             OpenSSL::SSL::VERIFY_PEER
+                           end
+              RestClient::Resource.new(
+                testurl,
+                timeout: config[:timeout],
+                ssl_client_cert: client_cert,
+                ssl_client_key: client_key,
+                ssl_ca_file: ca_file,
+                verify_ssl: verify_ssl
+              ).get
+            else
+              RestClient::Resource.new(testurl, timeout: config[:timeout], verify_ssl: true).get
+            end
           else
             RestClient::Resource.new(testurl, timeout: config[:timeout]).get
           end
@@ -129,7 +167,7 @@ class JenkinsMetrics < Sensu::Plugin::Metric::CLI::Graphite
       STDERR.write "Jenkins is not responding\n"
       critical
     rescue RestClient::RequestTimeout
-      STDERR.write "Jenkins Connection timed out\n"
+      STDERR.write "Jenkins connection timed out\n"
       critical
     ensure
       report_request_duration
